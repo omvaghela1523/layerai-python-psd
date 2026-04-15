@@ -3,9 +3,8 @@ from flask_cors import CORS
 import requests
 import io
 import os
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 from psd_tools import PSDImage
-from psd_tools.api.layers import PixelLayer
 
 app = Flask(__name__)
 CORS(app)
@@ -53,22 +52,13 @@ def generate_psd():
 
         # Step 4 — Vignette layer banao
         vignette = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        from PIL import ImageDraw, ImageFilter
         draw = ImageDraw.Draw(vignette)
         for i in range(min(width, height) // 2):
             opacity = int(120 * i / (min(width, height) // 2))
             draw.rectangle([i, i, width-i, height-i], outline=(0, 0, 0, opacity))
         vignette = vignette.filter(ImageFilter.GaussianBlur(radius=30))
 
-        # Step 5 — PSD file banao
-        psd = PSDImage.new("RGBA", (width, height))
-
-        # Background layer
-        bg_layer = psd.compose()
-
-        output = io.BytesIO()
-
-        # Simple approach — layers ke saath PIL image save karo
+        # Step 5 — Layers data collect karo
         layers_data = []
 
         # Background
@@ -98,8 +88,7 @@ def generate_psd():
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for layer_name, layer_data in layers_data:
                 zf.writestr(f"{layer_name}.png", layer_data)
-            
-            # Instructions file
+
             instructions = """LayerAI — Layer Export
 ==============================
 
