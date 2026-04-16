@@ -322,7 +322,7 @@ def generate_psd():
         layers_info.append({
             'name': 'Background',
             'image': original.copy(),
-            'blend_mode': b'norm',
+            'blend_mode': 'norm',
             'opacity': 255,
             'visible': True,
             'type': 'pixel',
@@ -346,7 +346,7 @@ def generate_psd():
                     layers_info.append({
                         'name': 'Subject — Masked',
                         'image': subject_img,
-                        'blend_mode': b'norm',
+                        'blend_mode': 'norm',
                         'opacity': 255,
                         'visible': True,
                         'type': 'pixel',
@@ -362,7 +362,7 @@ def generate_psd():
         layers_info.append({
             'name': 'Curves 1',
             'image': curves_img,
-            'blend_mode': b'over',  # Overlay
+            'blend_mode': 'over',  # Overlay
             'opacity': 180,
             'visible': True,
             'type': 'adjustment',
@@ -375,7 +375,7 @@ def generate_psd():
         layers_info.append({
             'name': 'Brightness/Contrast 1',
             'image': bc_img,
-            'blend_mode': b'norm',
+            'blend_mode': 'norm',
             'opacity': 120,
             'visible': True,
             'type': 'adjustment',
@@ -388,7 +388,7 @@ def generate_psd():
         layers_info.append({
             'name': 'Hue/Saturation 1',
             'image': hs_img,
-            'blend_mode': b'norm',
+            'blend_mode': 'norm',
             'opacity': 100,
             'visible': True,
             'type': 'adjustment',
@@ -401,7 +401,7 @@ def generate_psd():
         layers_info.append({
             'name': 'Color Balance 1',
             'image': cb_img,
-            'blend_mode': b'norm',
+            'blend_mode': 'norm',
             'opacity': 80,
             'visible': True,
             'type': 'adjustment',
