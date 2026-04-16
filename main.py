@@ -5,7 +5,7 @@ import io
 import os
 import struct
 import zlib
-from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
+from PIL import Image, ImageFilter, ImageEnhance, ImageDraw
 import numpy as np
 
 app = Flask(__name__)
@@ -13,346 +13,287 @@ CORS(app)
 
 REMOVE_BG_API_KEY = os.environ.get("REMOVE_BG_API_KEY")
 
-# ============================================================
-# PURE PYTHON PSD WRITER
-# PSD format manually implement kiya hai
-# ============================================================
+# ─── PSD Writer ───────────────────────────────────────────────────
+def write_pascal_string(s, padding=2):
+    encoded = s.encode('macroman') if s else b''
+    length = len(encoded)
+    data = struct.pack('>B', length) + encoded
+    pad = (padding - (len(data) % padding)) % padding
+    return data + b'\x00' * pad
 
-def pack_be(fmt, *args):
-    return struct.pack(">" + fmt, *args)
+def write_uint32(n): return struct.pack('>I', n)
+def write_uint16(n): return struct.pack('>H', n)
+def write_int16(n):  return struct.pack('>h', n)
+def write_uint8(n):  return struct.pack('>B', n)
 
-def psd_pascal_string(s, pad_to=2):
-    b = s.encode("ascii")
-    length = len(b)
-    data = bytes([length]) + b
-    while len(data) % pad_to != 0:
-        data += b'\x00'
-    return data
-
-def compress_rle(data, width, height, channels):
-    """PackBits RLE compression for PSD"""
-    compressed_rows = []
-    byte_counts = []
-    
-    for c in range(channels):
-        for row in range(height):
-            row_data = data[c, row, :]
-            compressed = packbits_encode(row_data)
-            compressed_rows.append(compressed)
-            byte_counts.append(len(compressed))
-    
-    return byte_counts, compressed_rows
-
-def packbits_encode(data):
-    """PackBits compression"""
-    result = bytearray()
+def compress_channel(data):
+    """PackBits RLE compression for PSD channels"""
+    result = []
+    bytecounts = []
     i = 0
-    n = len(data)
-    
-    while i < n:
-        # Find run of same bytes
+    while i < len(data):
         run_start = i
-        run_byte = data[i]
-        run_len = 1
-        
-        while i + run_len < n and data[i + run_len] == run_byte and run_len < 128:
-            run_len += 1
-        
-        if run_len > 1:
-            result.append(256 - run_len + 1)
-            result.append(run_byte)
+        if i + 1 < len(data) and data[i] == data[i+1]:
+            run_val = data[i]
+            run_len = 1
+            while i + run_len < len(data) and data[i + run_len] == run_val and run_len < 128:
+                run_len += 1
+            result.append(struct.pack('b', -(run_len - 1)))
+            result.append(bytes([run_val]))
             i += run_len
         else:
-            # Find literal run
-            lit_start = i
-            lit_len = 0
-            while i + lit_len < n and lit_len < 128:
-                # Check if next 2 bytes are same (start of run)
-                if i + lit_len + 1 < n and data[i + lit_len] == data[i + lit_len + 1]:
+            literal = [data[i]]
+            i += 1
+            while i < len(data) and len(literal) < 128:
+                if i + 1 < len(data) and data[i] == data[i+1]:
                     break
-                lit_len += 1
-            if lit_len == 0:
-                lit_len = 1
-            result.append(lit_len - 1)
-            result.extend(data[lit_start:lit_start + lit_len])
-            i += lit_len
-    
-    return bytes(result)
+                literal.append(data[i])
+                i += 1
+            result.append(struct.pack('b', len(literal) - 1))
+            result.extend([bytes([b]) for b in literal])
+        row_bytes = b''.join(result[run_start:])
+    return b''.join(result)
 
-def image_to_channels(img):
-    """PIL image ko channel arrays mein convert karo"""
-    arr = np.array(img.convert("RGBA"), dtype=np.uint8)
-    # PSD order: R, G, B, A
-    r = arr[:, :, 0]
-    g = arr[:, :, 1]
-    b = arr[:, :, 2]
-    a = arr[:, :, 3]
-    return np.stack([r, g, b, a], axis=0)  # shape: (4, H, W)
+def image_to_psd_channels(img, width, height):
+    """Convert PIL image to PSD channel data"""
+    if img.mode != 'RGBA':
+        img = img.convert('RGBA')
+    arr = np.array(img)
+    channels = []
+    # Alpha, R, G, B order for PSD
+    channel_order = [3, 0, 1, 2]
+    for c in channel_order:
+        channel_data = arr[:, :, c].tobytes()
+        channels.append(channel_data)
+    return channels
 
-def write_layer_channel_data(img):
-    """Layer ke channel data compress karke likho"""
-    channels = image_to_channels(img)
-    height, width = img.size[1], img.size[0]
-    num_channels = 4
+def build_psd(layers_info, width, height):
+    """Build a proper PSD file from scratch"""
     
-    byte_counts, compressed_rows = compress_rle(channels, width, height, num_channels)
-    
-    # Channel data buffer
-    buf = io.BytesIO()
-    
-    # Compression type: 1 = RLE
-    buf.write(pack_be("H", 1))
-    
-    # Row byte counts for all channels
-    for bc in byte_counts:
-        buf.write(pack_be("H", bc))
-    
-    # Compressed row data
-    for row_data in compressed_rows:
-        buf.write(row_data)
-    
-    return buf.getvalue()
+    # ── Header ──────────────────────────────────────────────────
+    header = b'8BPS'           # Signature
+    header += write_uint16(1)  # Version
+    header += b'\x00' * 6     # Reserved
+    header += write_uint16(4)  # Channels (RGBA)
+    header += write_uint32(height)
+    header += write_uint32(width)
+    header += write_uint16(8)  # Bits per channel
+    header += write_uint16(3)  # Color mode: RGB
 
-def create_psd(layers_info, width, height):
-    """
-    layers_info = list of (name, PIL_image, blend_mode, opacity, visible)
-    blend_mode: 'norm', 'mul ', 'scrn', 'over', 'lum '
-    """
-    buf = io.BytesIO()
-    
+    # ── Color Mode Data ─────────────────────────────────────────
+    color_mode = write_uint32(0)  # Empty for RGB
+
+    # ── Image Resources ─────────────────────────────────────────
+    image_resources = write_uint32(0)  # Empty
+
+    # ── Layer and Mask Info ──────────────────────────────────────
+    layer_records = b''
+    channel_image_data = b''
+
     num_layers = len(layers_info)
-    
-    # ── SECTION 1: File Header ──────────────────────────────
-    buf.write(b'8BPS')           # Signature
-    buf.write(pack_be("H", 1))   # Version
-    buf.write(b'\x00' * 6)       # Reserved
-    buf.write(pack_be("H", 4))   # Channels (R,G,B,A)
-    buf.write(pack_be("I", height))
-    buf.write(pack_be("I", width))
-    buf.write(pack_be("H", 8))   # Bits per channel
-    buf.write(pack_be("H", 3))   # Color mode: RGB
-    
-    # ── SECTION 2: Color Mode Data ──────────────────────────
-    buf.write(pack_be("I", 0))   # Empty
-    
-    # ── SECTION 3: Image Resources ──────────────────────────
-    buf.write(pack_be("I", 0))   # Empty
-    
-    # ── SECTION 4: Layer and Mask Information ───────────────
-    layer_mask_buf = io.BytesIO()
-    
-    # Layer Info
-    layer_info_buf = io.BytesIO()
-    
-    # Layer count (negative = merged alpha)
-    layer_info_buf.write(pack_be("h", -num_layers))
-    
-    # Layer records
-    layer_channel_data_list = []
-    
-    for (name, img, blend_mode, opacity, visible) in layers_info:
-        img = img.convert("RGBA").resize((width, height))
-        
-        top = 0
-        left = 0
-        bottom = height
-        right = width
-        
-        layer_info_buf.write(pack_be("I", top))
-        layer_info_buf.write(pack_be("I", left))
-        layer_info_buf.write(pack_be("I", bottom))
-        layer_info_buf.write(pack_be("I", right))
-        
-        # 4 channels: A, R, G, B
-        layer_info_buf.write(pack_be("H", 4))
+
+    for layer in layers_info:
+        img = layer['image']
+        name = layer['name']
+        blend_mode = layer.get('blend_mode', 'norm')
+        opacity = layer.get('opacity', 255)
+        layer_type = layer.get('type', 'pixel')
+
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+
+        arr = np.array(img)
+        top = layer.get('top', 0)
+        left = layer.get('left', 0)
+        bottom = top + height
+        right = left + width
+
+        # Channel info: alpha + RGB = 4 channels
+        num_channels = 4
         channel_ids = [-1, 0, 1, 2]  # Alpha, R, G, B
-        for cid in channel_ids:
-            layer_info_buf.write(pack_be("h", cid))
-            layer_info_buf.write(pack_be("I", 0))  # placeholder length
-        
+
+        # Layer record
+        layer_record = b''
+        layer_record += write_uint32(top)
+        layer_record += write_uint32(left)
+        layer_record += write_uint32(bottom)
+        layer_record += write_uint32(right)
+        layer_record += write_uint16(num_channels)
+
+        # Channel data sizes (placeholder, fill later)
+        channel_data_list = []
+        for idx, cid in enumerate(channel_ids):
+            if cid == -1:
+                ch_arr = arr[:, :, 3]
+            else:
+                ch_arr = arr[:, :, cid]
+            
+            # Compress with PackBits per row
+            rows = []
+            row_lengths = []
+            for row in ch_arr:
+                compressed = compress_channel(row.tobytes())
+                rows.append(compressed)
+                row_lengths.append(len(compressed))
+            
+            # Channel data: compression type + row lengths + compressed rows
+            ch_data = write_uint16(1)  # PackBits
+            for rl in row_lengths:
+                ch_data += write_uint16(rl)
+            ch_data += b''.join(rows)
+            channel_data_list.append((cid, ch_data))
+
+        for cid, ch_data in channel_data_list:
+            layer_record += write_int16(cid)
+            layer_record += write_uint32(len(ch_data))
+
         # Blend mode
-        layer_info_buf.write(b'8BIM')
-        bm = blend_mode.encode('ascii')
-        bm = bm + b' ' * (4 - len(bm))
-        layer_info_buf.write(bm)
-        layer_info_buf.write(bytes([opacity]))      # Opacity 0-255
-        layer_info_buf.write(bytes([0]))            # Clipping
-        flags = 0 if visible else 2
-        layer_info_buf.write(bytes([flags]))        # Flags
-        layer_info_buf.write(bytes([0]))            # Filler
-        
+        layer_record += b'8BIM'
+        blend_bytes = blend_mode.encode('ascii').ljust(4)[:4]
+        layer_record += blend_bytes
+        layer_record += write_uint8(opacity)
+        layer_record += write_uint8(0)   # Clipping
+        layer_record += write_uint8(4 if layer.get('visible', True) else 6)  # Flags
+        layer_record += write_uint8(0)   # Filler
+
         # Extra data
-        extra_buf = io.BytesIO()
-        
+        extra = b''
+
         # Layer mask (empty)
-        extra_buf.write(pack_be("I", 0))
-        
-        # Blending ranges (empty)
-        extra_buf.write(pack_be("I", 0))
-        
-        # Layer name (pascal string, padded to 4)
-        name_bytes = name.encode('ascii')[:255]
-        name_len = len(name_bytes)
-        extra_buf.write(bytes([name_len]))
-        extra_buf.write(name_bytes)
-        # Pad to multiple of 4
-        total = 1 + name_len
-        while total % 4 != 0:
-            extra_buf.write(b'\x00')
-            total += 1
-        
-        extra_data = extra_buf.getvalue()
-        layer_info_buf.write(pack_be("I", len(extra_data)))
-        layer_info_buf.write(extra_data)
-        
-        # Channel data store karo
-        layer_channel_data_list.append((img, channel_ids))
-    
-    # Channel image data
-    channel_image_buf = io.BytesIO()
-    for (img, channel_ids) in layer_channel_data_list:
-        channels = image_to_channels(img)
-        h, w = img.size[1], img.size[0]
-        
-        # Order: Alpha(id=-1), R(0), G(1), B(2)
-        channel_order = [3, 0, 1, 2]  # RGBA array indices
-        
-        for ch_idx in channel_order:
-            ch_data = channels[ch_idx]  # shape (H, W)
-            
-            # RLE compress
-            byte_counts = []
-            compressed_rows = []
-            for row in range(h):
-                compressed = packbits_encode(ch_data[row])
-                compressed_rows.append(compressed)
-                byte_counts.append(len(compressed))
-            
-            # Write compression type
-            channel_image_buf.write(pack_be("H", 1))
-            # Write byte counts
-            for bc in byte_counts:
-                channel_image_buf.write(pack_be("H", bc))
-            # Write compressed data
-            for rd in compressed_rows:
-                channel_image_buf.write(rd)
-    
-    layer_info_data = layer_info_buf.getvalue()
-    
-    # Pad to even
-    if len(layer_info_data) % 2 != 0:
-        layer_info_data += b'\x00'
-    
-    layer_mask_buf.write(pack_be("I", len(layer_info_data) + 4))
-    layer_mask_buf.write(pack_be("I", len(layer_info_data)))
-    layer_mask_buf.write(layer_info_data)
-    layer_mask_buf.write(channel_image_buf.getvalue())
-    
-    layer_mask_data = layer_mask_buf.getvalue()
-    buf.write(pack_be("I", len(layer_mask_data)))
-    buf.write(layer_mask_data)
-    
-    # ── SECTION 5: Merged Image Data ────────────────────────
-    # Flatten all layers
-    merged = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    for (name, img, blend_mode, opacity, visible) in reversed(layers_info):
-        if visible:
-            layer_img = img.convert("RGBA").resize((width, height))
-            merged = Image.alpha_composite(merged, layer_img)
-    
-    merged_rgb = merged.convert("RGB")
-    merged_arr = np.array(merged_rgb, dtype=np.uint8)
-    
-    buf.write(pack_be("H", 1))  # RLE compression
-    
-    # Write byte counts for all rows (R, G, B channels)
-    all_counts = []
-    all_compressed = []
+        extra += write_uint32(0)
+
+        # Layer blending ranges (empty)
+        extra += write_uint32(0)
+
+        # Layer name (pascal string, padded to 4 bytes)
+        name_enc = name.encode('ascii', errors='replace')[:255]
+        name_len = len(name_enc)
+        name_data = bytes([name_len]) + name_enc
+        pad = (4 - (len(name_data) % 4)) % 4
+        name_data += b'\x00' * pad
+        extra += name_data
+
+        layer_record += write_uint32(len(extra))
+        layer_record += extra
+
+        layer_records += layer_record
+
+        # Channel image data
+        for cid, ch_data in channel_data_list:
+            channel_image_data += ch_data
+
+    # Layer info section
+    layer_info = write_uint16(num_layers)
+    layer_info += layer_records
+    layer_info += channel_image_data
+
+    # Pad to 4 bytes
+    if len(layer_info) % 4:
+        layer_info += b'\x00' * (4 - len(layer_info) % 4)
+
+    layer_and_mask = write_uint32(len(layer_info) + 4)
+    layer_and_mask += write_uint32(len(layer_info))
+    layer_and_mask += layer_info
+    layer_and_mask += write_uint32(0)  # Global mask info
+
+    # ── Image Data (merged composite) ────────────────────────────
+    # Create merged image
+    merged = Image.new('RGBA', (width, height), (0, 0, 0, 255))
+    for layer in reversed(layers_info):
+        if layer.get('visible', True) and layer['image']:
+            merged = Image.alpha_composite(merged, layer['image'].resize((width, height)))
+
+    merged_arr = np.array(merged.convert('RGB'))
+    image_data = write_uint16(1)  # PackBits
+    for c in range(3):  # RGB only for merged
+        for row in merged_arr[:, :, c]:
+            compressed = compress_channel(row.tobytes())
+            image_data += write_uint16(len(compressed))
     for c in range(3):
-        for row in range(height):
-            rd = packbits_encode(merged_arr[row, :, c])
-            all_compressed.append(rd)
-            all_counts.append(len(rd))
-    
-    for bc in all_counts:
-        buf.write(pack_be("H", bc))
-    for rd in all_compressed:
-        buf.write(rd)
-    
-    return buf.getvalue()
+        for row in merged_arr[:, :, c]:
+            compressed = compress_channel(row.tobytes())
+            image_data += compressed
+
+    # Combine all sections
+    psd = header
+    psd += write_uint32(len(color_mode) - 4) + color_mode[4:]
+    psd += write_uint32(len(image_resources) - 4) + image_resources[4:]
+    psd += layer_and_mask
+    psd += image_data
+
+    # ── Proper PSD Assembly ──────────────────────────────────────
+    final = b'8BPS'
+    final += write_uint16(1)
+    final += b'\x00' * 6
+    final += write_uint16(4)
+    final += write_uint32(height)
+    final += write_uint32(width)
+    final += write_uint16(8)
+    final += write_uint16(3)
+    final += write_uint32(0)  # Color mode data length
+    final += write_uint32(0)  # Image resources length
+    final += write_uint32(len(layer_and_mask))
+    final += layer_and_mask
+    final += image_data
+
+    return final
 
 
-# ============================================================
-# LAYER BUILDING HELPERS
-# ============================================================
+def create_adjustment_layer(width, height, adj_type, values, opacity=200):
+    """Create adjustment layer overlay image"""
+    img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
 
-def make_color_grade_layer(width, height, image):
-    """Color grade overlay layer"""
-    arr = np.array(image.convert("RGB"), dtype=np.float32)
-    
-    # Warm highlights + cool shadows
-    grade = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    grade_arr = np.zeros((height, width, 4), dtype=np.uint8)
-    
-    # Subtle orange/warm tint in highlights
-    brightness = (arr[:,:,0] * 0.299 + arr[:,:,1] * 0.587 + arr[:,:,2] * 0.114) / 255.0
-    
-    grade_arr[:,:,0] = (brightness * 30).astype(np.uint8)   # R
-    grade_arr[:,:,1] = (brightness * 10).astype(np.uint8)   # G  
-    grade_arr[:,:,2] = ((1-brightness) * 20).astype(np.uint8) # B (shadows cool)
-    grade_arr[:,:,3] = 80  # opacity
-    
-    return Image.fromarray(grade_arr, "RGBA")
+    if adj_type == 'curves':
+        brightness = values.get('brightness', 0)
+        r = max(0, min(255, 128 + brightness * 2))
+        g = max(0, min(255, 128 + brightness))
+        b = max(0, min(255, 128))
+        img = Image.new('RGBA', (width, height), (r, g, b, opacity))
 
-def make_vignette_layer(width, height):
-    """Dark vignette around edges"""
-    vignette = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(vignette)
-    steps = min(width, height) // 2
-    for i in range(steps):
-        opacity = int(180 * (1 - i / steps) ** 2)
-        draw.rectangle([i, i, width-1-i, height-1-i], outline=(0, 0, 0, opacity))
-    vignette = vignette.filter(ImageFilter.GaussianBlur(radius=40))
-    return vignette
+    elif adj_type == 'brightness_contrast':
+        brightness = values.get('brightness', 0)
+        contrast = values.get('contrast', 0)
+        base = max(0, min(255, 128 + brightness))
+        img = Image.new('RGBA', (width, height), (base, base, base, max(0, min(255, abs(contrast) * 2))))
 
-def make_brightness_contrast_layer(width, height, brightness=1.0, contrast=1.0):
-    """Subtle brightness/contrast adjustment as overlay"""
-    # Create a neutral gray layer with slight adjustment
-    val = 128
-    if brightness > 1.0:
-        val = min(255, int(128 + (brightness - 1.0) * 128))
-    elif brightness < 1.0:
-        val = max(0, int(128 * brightness))
-    
-    layer = Image.new("RGBA", (width, height), (val, val, val, 30))
-    return layer
+    elif adj_type == 'hue_saturation':
+        saturation = values.get('saturation', 0)
+        hue = values.get('hue', 0)
+        s_val = max(0, min(255, 128 + saturation))
+        img = Image.new('RGBA', (width, height), (s_val, 128, 200, opacity // 2))
 
-def make_highlight_layer(width, height, image):
-    """Soft light / highlight enhancement layer"""
-    arr = np.array(image.convert("RGB"), dtype=np.float32)
-    brightness = (arr[:,:,0] * 0.299 + arr[:,:,1] * 0.587 + arr[:,:,2] * 0.114) / 255.0
-    
-    highlight_arr = np.zeros((height, width, 4), dtype=np.uint8)
-    # White highlights where bright
-    highlight_arr[:,:,0] = (brightness * 255).astype(np.uint8)
-    highlight_arr[:,:,1] = (brightness * 255).astype(np.uint8)
-    highlight_arr[:,:,2] = (brightness * 255).astype(np.uint8)
-    highlight_arr[:,:,3] = (brightness * 40).astype(np.uint8)
-    
-    return Image.fromarray(highlight_arr, "RGBA")
+    elif adj_type == 'color_balance':
+        cyan_red = values.get('cyan_red', 0)
+        magenta_green = values.get('magenta_green', 0)
+        yellow_blue = values.get('yellow_blue', 0)
+        r = max(0, min(255, 128 + cyan_red * 2))
+        g = max(0, min(255, 128 + magenta_green * 2))
+        b = max(0, min(255, 128 + yellow_blue * 2))
+        img = Image.new('RGBA', (width, height), (r, g, b, opacity // 3))
+
+    elif adj_type == 'vignette':
+        img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        steps = 60
+        for i in range(steps):
+            ratio = i / steps
+            alpha = int(180 * (1 - ratio))
+            x0 = int(width * ratio * 0.5)
+            y0 = int(height * ratio * 0.5)
+            x1 = width - x0
+            y1 = height - y0
+            draw.rectangle([x0, y0, x1, y1], outline=(0, 0, 0, alpha))
+        img = img.filter(ImageFilter.GaussianBlur(radius=width // 20))
+
+    return img
 
 
-# ============================================================
-# FLASK ROUTES
-# ============================================================
-
+# ─── Routes ───────────────────────────────────────────────────────
 @app.route("/")
-def health():
-    return jsonify({"status": "ok", "service": "LayerAI Python PSD", "version": "2.0.0"})
-
 @app.route("/health")
-def health_check():
-    return jsonify({"status": "ok"})
+def health():
+    return jsonify({"status": "ok", "service": "LayerAI Python PSD", "version": "3.0.0"})
+
 
 @app.route("/generate-psd", methods=["POST"])
 def generate_psd():
@@ -363,88 +304,142 @@ def generate_psd():
         image_file = request.files["image"]
         image_bytes = image_file.read()
 
-        # Original image load karo
-        original_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        width, height = original_image.size
-        
-        print(f"Image size: {width}x{height}")
+        # Load original image
+        original = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        width, height = original.size
 
-        # ── Subject extraction via Remove.bg ────────────────
-        subject_image = None
-        background_image = None
-        
+        # Limit size for performance
+        max_size = 2000
+        if width > max_size or height > max_size:
+            ratio = min(max_size / width, max_size / height)
+            width = int(width * ratio)
+            height = int(height * ratio)
+            original = original.resize((width, height), Image.LANCZOS)
+
+        layers_info = []
+
+        # ── Layer 1: Background ──────────────────────────────────
+        layers_info.append({
+            'name': 'Background',
+            'image': original.copy(),
+            'blend_mode': b'norm',
+            'opacity': 255,
+            'visible': True,
+            'type': 'pixel',
+            'top': 0, 'left': 0
+        })
+
+        # ── Layer 2: Subject (Remove.bg) ─────────────────────────
+        subject_extracted = False
         if REMOVE_BG_API_KEY:
             try:
-                response = requests.post(
+                resp = requests.post(
                     "https://api.remove.bg/v1.0/removebg",
                     files={"image_file": ("image.jpg", image_bytes, "image/jpeg")},
                     data={"size": "auto"},
                     headers={"X-Api-Key": REMOVE_BG_API_KEY},
                     timeout=30
                 )
-                if response.status_code == 200:
-                    subject_image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-                    subject_image = subject_image.resize((width, height))
-                    print("Subject extracted via remove.bg ✓")
-                    
-                    # Background = original with subject area dimmed
-                    background_image = original_image.copy()
-                else:
-                    print(f"Remove.bg failed: {response.status_code}")
+                if resp.status_code == 200:
+                    subject_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                    subject_img = subject_img.resize((width, height), Image.LANCZOS)
+                    layers_info.append({
+                        'name': 'Subject — Masked',
+                        'image': subject_img,
+                        'blend_mode': b'norm',
+                        'opacity': 255,
+                        'visible': True,
+                        'type': 'pixel',
+                        'top': 0, 'left': 0
+                    })
+                    subject_extracted = True
             except Exception as e:
                 print(f"Remove.bg error: {e}")
 
-        # ── Build all layers ────────────────────────────────
-        color_grade = make_color_grade_layer(width, height, original_image)
-        vignette = make_vignette_layer(width, height)
-        brightness_layer = make_brightness_contrast_layer(width, height, brightness=1.05)
-        highlight_layer = make_highlight_layer(width, height, original_image)
+        # ── Layer 3: Curves Adjustment ───────────────────────────
+        curves_img = create_adjustment_layer(width, height, 'curves',
+            {'brightness': 15}, opacity=180)
+        layers_info.append({
+            'name': 'Curves 1',
+            'image': curves_img,
+            'blend_mode': b'over',  # Overlay
+            'opacity': 180,
+            'visible': True,
+            'type': 'adjustment',
+            'top': 0, 'left': 0
+        })
 
-        # ── Assemble PSD layers (bottom → top) ──────────────
-        # (name, image, blend_mode, opacity_0_255, visible)
-        layers = []
+        # ── Layer 4: Brightness/Contrast ─────────────────────────
+        bc_img = create_adjustment_layer(width, height, 'brightness_contrast',
+            {'brightness': 10, 'contrast': 20}, opacity=120)
+        layers_info.append({
+            'name': 'Brightness/Contrast 1',
+            'image': bc_img,
+            'blend_mode': b'norm',
+            'opacity': 120,
+            'visible': True,
+            'type': 'adjustment',
+            'top': 0, 'left': 0
+        })
 
-        # 1. Background (bottom)
-        layers.append(("Background", original_image, "norm", 255, True))
+        # ── Layer 5: Hue/Saturation ──────────────────────────────
+        hs_img = create_adjustment_layer(width, height, 'hue_saturation',
+            {'saturation': 20, 'hue': 5}, opacity=100)
+        layers_info.append({
+            'name': 'Hue/Saturation 1',
+            'image': hs_img,
+            'blend_mode': b'norm',
+            'opacity': 100,
+            'visible': True,
+            'type': 'adjustment',
+            'top': 0, 'left': 0
+        })
 
-        # 2. Subject masked layer (if available)
-        if subject_image:
-            layers.append(("Subject_Masked", subject_image, "norm", 255, True))
+        # ── Layer 6: Color Balance ────────────────────────────────
+        cb_img = create_adjustment_layer(width, height, 'color_balance',
+            {'cyan_red': -10, 'magenta_green': 5, 'yellow_blue': 15}, opacity=80)
+        layers_info.append({
+            'name': 'Color Balance 1',
+            'image': cb_img,
+            'blend_mode': b'norm',
+            'opacity': 80,
+            'visible': True,
+            'type': 'adjustment',
+            'top': 0, 'left': 0
+        })
 
-        # 3. Color Grade
-        layers.append(("Color_Grade", color_grade, "norm", 180, True))
+        # ── Layer 7: Vignette ─────────────────────────────────────
+        vig_img = create_adjustment_layer(width, height, 'vignette', {}, opacity=150)
+        layers_info.append({
+            'name': 'Vignette',
+            'image': vig_img,
+            'blend_mode': b'mul ',  # Multiply
+            'opacity': 150,
+            'visible': True,
+            'type': 'pixel',
+            'top': 0, 'left': 0
+        })
 
-        # 4. Highlight layer
-        layers.append(("Highlights", highlight_layer, "norm", 200, True))
+        # ── Build PSD ─────────────────────────────────────────────
+        psd_bytes = build_psd(layers_info, width, height)
 
-        # 5. Brightness/Contrast
-        layers.append(("Brightness_Contrast", brightness_layer, "norm", 100, True))
-
-        # 6. Vignette (top)
-        layers.append(("Vignette", vignette, "norm", 220, True))
-
-        # ── Generate PSD ─────────────────────────────────────
-        print("Generating PSD...")
-        psd_data = create_psd(layers, width, height)
-        print(f"PSD size: {len(psd_data)} bytes")
-
-        psd_buffer = io.BytesIO(psd_data)
+        psd_buffer = io.BytesIO(psd_bytes)
         psd_buffer.seek(0)
 
         return send_file(
             psd_buffer,
-            mimetype="image/vnd.adobe.photoshop",
+            mimetype='application/octet-stream',
             as_attachment=True,
-            download_name="layerai-edited.psd"
+            download_name='layerai-export.psd'
         )
 
     except Exception as e:
+        print(f"PSD generation error: {e}")
         import traceback
-        print(f"Error: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
